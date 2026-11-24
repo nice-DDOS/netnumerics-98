@@ -62,3 +62,83 @@ const nnRenderOriginal=render;render=function(){nnRenderOriginal();nnLocalize();
 const nnThemeOriginal=$('theme').onclick;$('theme').onclick=function(){nnThemeOriginal();nnLocalize();};
 nnLangButton.onclick=()=>{nnLang=nnLang==='ar'?'en':'ar';try{localStorage.setItem('nn-lang',nnLang)}catch{}nnLocalize();};
 nnLocalize();
+
+function parseCapture(buffer, target=''){
+  const v=new DataView(buffer);
+  if(v.byteLength<24)throw Error('Invalid or incomplete PCAP header.');
+  const magic=v.getUint32(0,false), little=magic===0xd4c3b2a1||magic===0x4d3cb2a1, nano=magic===0xa1b23c4d||magic===0x4d3cb2a1;
+  if(![0xa1b2c3d4,0xd4c3b2a1,0xa1b23c4d,0x4d3cb2a1].includes(magic))throw Error('Use classic PCAP, not PCAPNG. Export as PCAP in Wireshark.');
+  if(v.getUint16(4,little)!==2||v.getUint16(6,little)!==4)throw Error('Unsupported PCAP version.');
+  if((v.getUint32(20,little)&0xffff)!==1)throw Error('Only Ethernet PCAP is supported.');
+  if(target&&!/^\d{1,3}(\.\d{1,3}){3}$/.test(target))throw Error('Enter a valid IPv4 destination or leave blank.');
+  if(target&&target.split('.').some(x=>+x>255||String(+x)!==x))throw Error('Enter a valid IPv4 destination or leave blank.');
+  let pos=24,first=null,last=null,packets=0,records=[],outOfOrder=0;
+  const ip=i=>[0,1,2,3].map(j=>v.getUint8(i+j)).join('.');
+  while(pos<v.byteLength){
+    if(pos+16>v.byteLength)throw Error('Incomplete PCAP record.');
+    const frac=v.getUint32(pos+4,little),scale=nano?1e9:1e6, ts=v.getUint32(pos,little)+frac/scale, len=v.getUint32(pos+8,little),wire=v.getUint32(pos+12,little);
+    pos+=16;if(frac>=scale||len>wire||len>v.byteLength-pos)throw Error('Invalid or truncated packet record.');
+    if(first===null)first=ts;
+    if(last!==null&&ts<last)outOfOrder++;
+    last=last===null?ts:Math.max(last,ts);
+    if(ts<first)throw Error('Capture timestamps precede the first record.');
+    if(++packets>250000)throw Error('Limit: 250,000 packets per capture.');
+    let p=pos+14,end=pos+len,type=len>=14?v.getUint16(pos+12,false):0;
+    for(let tags=0;tags<2&&(type===0x8100||type===0x88a8)&&p+4<=end;tags++){type=v.getUint16(p+2,false);p+=4}
+    if(type===0x0800&&p+20<=end&&(v.getUint8(p)>>4)===4){
+      const ihl=(v.getUint8(p)&15)*4,total=v.getUint16(p+2,false),proto=v.getUint8(p+9),dst=ip(p+16);
+      if(ihl>=20&&total>=ihl&&p+ihl<=end&&(!target||target===dst)){
+        const offset=v.getUint16(p+6,false)&0x1fff, trans=p+ihl;
+        const port=(proto===6||proto===17)&&offset===0&&total>=ihl+4&&trans+4<=end?v.getUint16(trans+2,false):null;
+        const kind=proto===6?'TCP':proto===17?'UDP':proto===1?'ICMP':'IP-'+proto;
+        records.push({t:ts-first,dst,kind,port});
+      }
+    }
+    pos=end;
+  }
+  if(first===null||last-first<9)throw Error('Capture must cover at least 9 seconds.');
+  const width=Math.max(1,Math.ceil((last-first)/5000)),count=Math.floor((last-first)/width);
+  if(count<9||count>5000)throw Error('Capture needs 9–5000 complete time bins.');
+  const counts=new Uint32Array(count),details=Array.from({length:count},()=>new Map());
+  let used=0;
+  for(const rec of records){let i=Math.floor(rec.t/width);if(i<0||i>=count)continue;used++;counts[i]++;let key=rec.dst+' / '+rec.kind+(rec.port===null?'':':'+rec.port);details[i].set(key,(details[i].get(key)||0)+1)}
+  if(!used)throw Error('No matching IPv4 packets in the complete intervals.');
+  return {data:Array.from(counts,(n,i)=>({t:i*width,y:n/width})),details,used,packets,width,count,duration:last-first,outOfOrder,target};
+}
+
+/* Defensive capture investigation: local file processing, no network activity. */
+let captureSession=null;
+const capT=(en,ar)=>nnLang==='ar'?ar:en;
+function capPage(){
+  let c=captureSession,r=c?.result;
+  let content=head(capT('Network capture investigation','تحقيق جنائي في حركة الشبكة'),capT('Real packet metadata → numerical anomaly analysis → destination evidence','بيانات الحزم الفعلية ← كشف الشذوذ عددياً ← أدلة الوجهة'));
+  content+=panel(capT('1. Open an authorized packet capture','1. افتح ملف التقاط مصرحاً به'),'<div class="formgrid"><div class="field"><label for="capFile">PCAP (Ethernet IPv4, ≤ 32 MB)</label><input type="file" id="capFile" accept=".pcap,application/octet-stream"></div><div class="field"><label for="capTarget">'+capT('Destination IPv4 (optional)','عنوان IPv4 للوجهة (اختياري)')+'</label><input id="capTarget" type="text" placeholder="192.0.2.1" value="'+esc(c?.target||'')+'"></div></div><button id="capOpen">'+capT('Read capture locally','قراءة ملف الالتقاط محلياً')+'</button><p class="sub">'+capT('Use an existing, authorized Wireshark capture. Save As classic PCAP (not PCAPNG). Only Ethernet IPv4 metadata is analyzed, never payloads; the last incomplete interval is excluded.','استخدم ملف التقاط مصرحاً به من Wireshark. احفظه بصيغة PCAP التقليدية لا PCAPNG. يُحلّل وصف حزم Ethernet IPv4 فقط دون محتواها، وتُستثنى الفترة الأخيرة غير المكتملة.')+'</p><p id="capError" class="alert" role="alert"></p>');
+  if(!c)return content+'<div class="notice">'+capT('Unlike the demo, this page uses observed packet timestamps and destination metadata. It cannot establish malicious intent by itself.','بعكس المحاكاة، تعتمد هذه الصفحة على أزمنة الحزم المرصودة وبيانات الوجهات. لا تستطيع وحدها إثبات وجود هجوم.')+'</div>';
+  content+=panel(capT('2. Define a normal training period','2. حدد فترة النشاط الطبيعي'),'<p>'+esc(c.name)+' · '+fmt(c.packets,0)+' '+capT('captured packets','حزمة ملتقطة')+' · '+fmt(c.used,0)+' '+capT('matching IPv4 packets','حزمة IPv4 مطابقة')+' · '+fmt(c.count,0)+' '+capT('complete intervals','فترة مكتملة')+' · '+fmt(c.width,0)+' s/bin</p><div class="formgrid"><div class="field"><label for="capN">'+capT('Initial normal intervals','عدد الفترات الطبيعية الأولى')+'</label><input id="capN" type="number" min="5" max="'+(c.count-4)+'" value="'+(c.n||Math.min(20,Math.max(5,Math.floor(c.count/3))))+'"></div><div class="field"><label for="capLimit">'+capT('Alert threshold (packets/s above model; blank = max(1, 3 × RMSE))','عتبة التنبيه (حزمة/ث فوق النموذج؛ فارغة = max(1, 3 × RMSE))')+'</label><input id="capLimit" type="number" min="0.000001" step="any" value="'+esc(c.limit??'')+'"></div></div><label><input id="capVerified" type="checkbox" style="width:auto" '+(c.verified?'checked':'')+'> '+capT('The initial intervals are known normal (otherwise results are exploratory)','الفترات الأولى معروفة بأنها طبيعية (وإلا فالنتائج استكشافية)')+'</label><button id="capAnalyze">'+capT('Analyze real traffic','تحليل الحركة الفعلية')+'</button><p class="sub">'+capT('Automatic threshold is a heuristic, not a probability of attack. A linear model may extrapolate poorly.','العتبة التلقائية قاعدة تقريبية وليست احتمال وقوع هجوم. وقد يكون استقراء النموذج الخطي غير دقيق.')+'</p>');
+  if(!r)return content;
+  const totals=new Map();for(const i of r.alerts)for(const [key,n] of c.details[i])totals.set(key,(totals.get(key)||0)+n);
+  const top=[...totals].sort((a,b)=>b[1]-a[1]).slice(0,12);
+  content+='<div class="kpis">'+kpi(capT('Flagged intervals','الفترات المنبّه عنها'),r.alerts.length,capT('intervals','فترة'),r.alerts.length?'alert':'ok')+kpi(capT('Estimated crossing','أول تجاوز تقديري'),fmt(r.cross),capT('seconds from capture start','ثانية من بداية الالتقاط'))+kpi(capT('Excess packet estimate','الحزم الزائدة المقدّرة'),fmt(r.int.trap,1),capT('packets','حزمة'))+kpi(capT('Baseline RMSE','خطأ النموذج RMSE'),fmt(r.model.rmse),capT('packets/s','حزمة/ث'))+'</div>';
+  content+=panel(capT('3. Investigate flagged intervals','3. افحص الفترات المنبّه عنها'),'<p class="'+(r.alerts.length?'alert':'ok')+'">'+(c.verified?capT('Known-normal baseline selected by user.','خط أساس طبيعي حسب تحديد المستخدم.'):capT('Exploratory result: baseline has not been verified.','نتيجة استكشافية: خط الأساس غير مؤكد.'))+'</p>'+graph(r).replace('events/s · shaded = training period','packets/s · shaded = training period')+'<p class="sub">'+capT('Green: observed; dashed grey: baseline; orange: threshold; red: flagged. Crossing is an interpolated estimate between interval labels, not an exact packet timestamp.','أخضر: مرصود؛ رمادي متقطع: خط الأساس؛ برتقالي: العتبة؛ أحمر: تنبيه. زمن التجاوز تقدير بالاستيفاء بين الفترات وليس وقت حزمة بالضبط.')+'</p>'+table([capT('Destination / protocol : port','الوجهة / البروتوكول : المنفذ'),capT('Packets in flagged intervals','الحزم في الفترات المنبّه عنها')],top.map(([key,n])=>[esc(key),fmt(n,0)]))+(top.length?'':'<p>'+capT('No flagged destination evidence.','لا توجد أدلة وجهات ضمن فترات متجاوزة.')+'</p>')+'<p class="sub">'+capT('Counts describe traffic during flagged intervals, not attacker identities or malicious packets. Compare with service and firewall logs.','الأعداد تصف الحركة أثناء فترات التنبيه، ولا تحدد المهاجم أو الحزم الخبيثة. قارنها مع سجلات الخدمة والجدار الناري.')+'</p><button data-tab="roots">'+capT('Compare numerical root solvers','قارن طرق إيجاد الجذور')+'</button> <button data-tab="methods">'+capT('Inspect numerical calculations','افحص الحسابات العددية')+'</button> <button id="capReport">'+capT('Export investigation JSON','تصدير تقرير التحقيق JSON')+'</button>');
+  return content;
+}
+function capBind(){
+  const err=e=>{$('capError').textContent=e.message;};
+  $('capOpen').onclick=async()=>{try{const f=$('capFile').files[0],target=$('capTarget').value.trim();if(!f)throw Error(capT('Select a PCAP file first.','اختر ملف PCAP أولاً.'));if(f.size>32*1024*1024)throw Error('Limit: 32 MB.');const parsed=parseCapture(await f.arrayBuffer(),target);captureSession={...parsed,name:f.name};render();}catch(e){err(e);}};
+  if($('capAnalyze'))$('capAnalyze').onclick=()=>{try{const c=captureSession,n=Number($('capN').value),raw=$('capLimit').value.trim();if(!Number.isInteger(n)||n<5||n>c.count-4)throw Error(capT('Invalid baseline length.','عدد فترات التدريب غير صالح.'));const limit=raw===''?Math.max(1,3*NN.fit(c.data.slice(0,n).map(x=>x.y),1).rmse):Number(raw);const result=NN.analyze(c.data,n,limit,1,state.wasm);Object.assign(c,{n,limit,verified:$('capVerified').checked,result});Object.assign(state,{data:c.data,n,limit,degree:1,source:'Imported · '+c.name});run();}catch(e){err(e);}};
+  if($('capReport'))$('capReport').onclick=()=>{const c=captureSession,r=c.result,totals=new Map();for(const i of r.alerts)for(const [key,n] of c.details[i])totals.set(key,(totals.get(key)||0)+n);download('capture-investigation.json',JSON.stringify({project:'NetNumerics 98',capture:c.name,scope:'Ethernet IPv4 metadata; incomplete last interval excluded',target:c.target||null,packets:c.packets,matchingCompleteIntervalPackets:c.used,binSeconds:c.width,baselineVerifiedByUser:c.verified,baselineIntervals:c.n,thresholdPacketsPerSecond:c.limit,rmse:r.model.rmse,estimatedCrossingSeconds:r.cross,flaggedIntervalStarts:r.alerts.map(i=>r.data[i].t),estimatedExcessPackets:r.int,solvers:r.roots,destinationEvidence:[...totals].sort((a,b)=>b[1]-a[1]).slice(0,100),disclaimer:'Not proof of attack; contains destination IP metadata.'},null,2),'application/json');};
+}
+nnArabic.set('▤ PCAP investigation','▤ تحقيق ملفات PCAP');
+nnArabic.set('PCAP investigation','تحقيق ملفات PCAP');
+nnArabic.set('packets/s · shaded = training period','حزمة/ث · المنطقة المظللة = فترة التدريب');
+names.capture='PCAP investigation';
+const capNav=document.createElement('button');capNav.dataset.tab='capture';capNav.textContent='▤ PCAP investigation';document.querySelector('.sidebar .sidehead').after(capNav);
+const capOldRender=render;
+render=function(){
+  if(state.tab==='capture'){
+    $('address').textContent=names.capture;document.querySelectorAll('.sidebar [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab==='capture'));
+    $('content').innerHTML=capPage();capBind();nnLocalize();
+  }else{capOldRender();if(state.tab==='dashboard'){const link=document.createElement('button');link.dataset.tab='capture';link.textContent='▤ PCAP investigation';$('content').querySelector('h1').after(link);nnLocalize();}}
+};
+const capOldToggle=nnLangButton.onclick;nnLangButton.onclick=()=>{capOldToggle();if(state.tab==='capture')render();};
+render();
