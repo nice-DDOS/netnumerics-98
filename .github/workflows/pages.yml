@@ -46,6 +46,33 @@ jobs:
           (p / 'index.html').write_text(html, encoding='utf-8')
           (p / 'ar.html').write_text(html, encoding='utf-8')
           PY
+      - name: Generate verified offline packet capture fixture
+        run: |
+          python3 - <<'PY'
+          import struct, socket
+          from pathlib import Path
+          def checksum(data):
+              if len(data)%2: data+=b'\0'
+              s=sum(struct.unpack('!%dH'%(len(data)//2),data))
+              while s>>16: s=(s&65535)+(s>>16)
+              return (~s)&65535
+          rates=[10]*25+[10+2*(i+1) for i in range(10)]+[30]*15+[10]*10
+          path=Path('site/NetNumerics-Lab-Sample.pcap')
+          with path.open('wb') as f:
+              f.write(struct.pack('<IHHIIII',0xa1b2c3d4,2,4,0,0,65535,1))
+              i=0
+              for sec,n in enumerate(rates+[1]):
+                  for k in range(n):
+                      dst,port=('192.0.2.20',9000) if k<10 else ('192.0.2.30',9001)
+                      payload=b'NETNUMERICS OFFLINE LAB'
+                      udp=struct.pack('!HHHH',49152,port,8+len(payload),0)+payload
+                      ip=struct.pack('!BBHHHBBH4s4s',0x45,0,20+len(udp),i%65536,0,64,17,0,socket.inet_aton('192.0.2.10'),socket.inet_aton(dst))
+                      ip=ip[:10]+struct.pack('!H',checksum(ip))+ip[12:]
+                      pkt=bytes.fromhex('0200000000020200000000010800')+ip+udp
+                      f.write(struct.pack('<IIII',1700000000+sec,k*1000000//n,len(pkt),len(pkt))+pkt)
+                      i+=1
+          assert i==1011 and path.stat().st_size==81915
+          PY
       - name: Browser smoke test (Arabic, English and numerical parity)
         run: |
           npm install --no-save --no-package-lock playwright
@@ -74,6 +101,37 @@ jobs:
               assert.match(await page.locator('#content h1').innerText(),/نشاط الشبكة/);
               await page.locator('.sidebar [data-tab="methods"]').click();
               assert.match(await page.locator('#content h1').innerText(),/الطرق العددية/);
+              await page.locator('.sidebar [data-tab="capture"]').click();
+              await page.locator('#capFile').setInputFiles('site/NetNumerics-Lab-Sample.pcap');
+              await page.locator('#capOpen').click();
+              await page.locator('#capN').waitFor();
+              await page.locator('#capN').fill('20');
+              await page.locator('#capLimit').fill('5');
+              await page.locator('#capVerified').check();
+              await page.locator('#capAnalyze').click();
+              await page.locator('.kpi strong').first().waitFor();
+              assert.deepEqual(await page.locator('.kpi strong').allTextContents(),['23','26.5','410','0']);
+              assert.match(await page.locator('#content').innerText(),/192\.0\.2\.30/);
+              const downloadEvent=page.waitForEvent('download');
+              await page.locator('#capReport').click();
+              const report=JSON.parse(require('node:fs').readFileSync(await (await downloadEvent).path(),'utf8'));
+              assert.equal(report.packets,1011);
+              assert.equal(report.matchingCompleteIntervalPackets,1010);
+              assert.equal(report.flaggedIntervalStarts.length,23);
+              assert.equal(report.destinationEvidence[0][0],'192.0.2.30 / UDP:9001');
+              assert.equal(report.destinationEvidence[0][1],404);
+              await page.locator('#language').click();
+              assert.match(await page.locator('#content h1').innerText(),/Network capture investigation/);
+              assert.deepEqual(await page.locator('.kpi strong').allTextContents(),['23','26.5','410','0']);
+              await page.locator('#capFile').setInputFiles('site/NetNumerics-Lab-Sample.pcap');
+              await page.locator('#capTarget').fill('192.0.2.20');
+              await page.locator('#capOpen').click();
+              await page.waitForFunction(()=>document.querySelector('#capAnalyze')&&!document.querySelector('.kpi'));
+              await page.locator('#capN').fill('20');
+              await page.locator('#capLimit').fill('5');
+              await page.locator('#capAnalyze').click();
+              assert.equal(await page.locator('.kpi strong').first().innerText(),'0');
+              console.log('PASS: PCAP import, numerical results, JSON evidence, bilingual UI and destination filter');
               assert.deepEqual(errors,[]);
               console.log('PASS: Arabic/English toggle, unchanged KPIs, WASM, compact desktop and navigation');
             } finally {await browser.close()}
