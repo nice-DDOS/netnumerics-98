@@ -145,14 +145,14 @@ render();
 
 function forensicAnalyze(buffer){
   const v=new DataView(buffer),N=v.byteLength;if(N<24||N>32*1024*1024)throw Error('Capture size must be 24 bytes–32 MB.');
-  const rows=[];let frames=0,skipped=0,truncated=0,format='',interfaces=[],first=null,last=null,originSeconds=null;
+  const rows=[],inventory=[];let frames=0,skipped=0,truncated=0,format='',interfaces=[],first=null,last=null,originSeconds=null;
   function relativeTime(seconds,fraction){if(originSeconds===null)originSeconds=seconds;const delta=seconds-originSeconds;if(delta>3155760000n||delta< -3155760000n)throw Error('Capture timestamps exceed supported span.');return Number(delta)+fraction;}
   function record(p,n,link,t,wire=n){
     if(++frames>250000)throw Error('Maximum 250,000 frames.');
     if(!Number.isFinite(t))throw Error('Invalid timestamp.');
     if(n<wire)truncated++;
     first=first===null?t:Math.min(first,t);last=last===null?t:Math.max(last,t);
-    const end=p+n,frameStart=p;let type=0x0800;
+    const end=p+n,frameStart=p;const item={frame:frames,t,offset:p,captured:n,wire,link};inventory.push(item);let type=0x0800;
     if(link===1){if(n<14){skipped++;return}type=v.getUint16(p+12,false);p+=14;for(let k=0;k<2&&(type===0x8100||type===0x88a8)&&p+4<=end;k++){type=v.getUint16(p+2,false);p+=4}}
     else if(link!==101&&link!==228){skipped++;return}
     if(type!==0x0800||p+20>end||v.getUint8(p)>>4!==4){skipped++;return}
@@ -160,6 +160,11 @@ function forensicAnalyze(buffer){
     if(ihl<20||len<ihl||p+ihl>end||len>wire-(p-frameStart)){skipped++;return}
     const ip=i=>[0,1,2,3].map(k=>v.getUint8(i+k)).join('.');
     const proto=v.getUint8(p+9),ttl=v.getUint8(p+8),src=ip(p+12),dst=ip(p+16);
+    Object.assign(item,{src,dst,proto,ttl,len});const trans=p+ihl,ipEnd=p+len,fragment=v.getUint16(p+6,false)&0x3fff;
+    if(!fragment&&ipEnd<=end){
+      if(proto===17&&trans+8<=ipEnd){const ulen=v.getUint16(trans+4,false);if(ulen>=8&&trans+ulen<=ipEnd)Object.assign(item,{sport:v.getUint16(trans,false),dport:v.getUint16(trans+2,false),payloadOffset:trans+8,payloadLength:ulen-8});}
+      else if(proto===6&&trans+20<=ipEnd){const h=(v.getUint8(trans+12)>>4)*4;if(h>=20&&trans+h<=ipEnd)Object.assign(item,{sport:v.getUint16(trans,false),dport:v.getUint16(trans+2,false),payloadOffset:trans+h,payloadLength:ipEnd-trans-h});}
+    }
     rows.push({frame:frames,t,src,dst,proto,ttl,len});
   }
   const magic=v.getUint32(0,false);
@@ -183,7 +188,7 @@ function forensicAnalyze(buffer){
       p=end;
     }
   }else throw Error('Unknown capture signature. File extension is not used to determine format.');
-  if(!rows.length)throw Error('No supported IPv4 packets (Ethernet or raw IPv4).');
+  if(!frames)throw Error('Capture contains no packets.');
   const groups=new Map(),protoStats=new Map(),ttlCounts=new Map();
   for(const x of rows){const key=x.src+' → '+x.dst+' / '+x.proto;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(x);if(!protoStats.has(x.proto))protoStats.set(x.proto,{n:0,sum:0,sq:0});const s=protoStats.get(x.proto);s.n++;s.sum+=x.ttl;s.sq+=x.ttl*x.ttl;ttlCounts.set(x.ttl,(ttlCounts.get(x.ttl)||0)+1)}
   const mean=a=>a.reduce((s,x)=>s+x,0)/a.length;
@@ -198,7 +203,7 @@ function forensicAnalyze(buffer){
     result.push({src:x.src,dst:x.dst,proto:x.proto,n,ttl,sd,len,lsd,ref,refSD,referenceCount:rn,abs,relative,z,slope,rmse,start:start-first,end:end-first,frames:a.map(q=>q.frame),filter:'ip.src == '+x.src+' && ip.dst == '+x.dst+' && ip.proto == '+x.proto});
   }
   result.sort((a,b)=>(b.z??-1)-(a.z??-1)||b.n-a.n);
-  return {format,frames,ipv4:rows.length,skipped,truncated,duration:last-first,protocols:[...protoStats].map(([p,s])=>[p,s.n]),ttlCounts:[...ttlCounts].sort((a,b)=>a[0]-b[0]),groups:result};
+  const output={format,frames,ipv4:rows.length,skipped,truncated,duration:last-first,protocols:[...protoStats].map(([p,s])=>[p,s.n]),ttlCounts:[...ttlCounts].sort((a,b)=>a[0]-b[0]),groups:result};Object.defineProperties(output,{inventory:{value:inventory},bytes:{value:new Uint8Array(buffer)},timeOrigin:{value:first}});return output;
 }
 
 /* Offline forensic review of packet metadata; no payload extraction or network activity. */
@@ -208,7 +213,7 @@ const fp=p=>({6:'TCP',17:'UDP',1:'ICMP'})[p]||'IP-'+p;
 function forensicPage(){
   const f=forensicSession;
   let h=head(capT('Packet forensic analysis','التحليل الجنائي للحزم'),capT('PCAP / PCAPNG · short captures · numerical evidence · local processing','PCAP / PCAPNG · الالتقاطات القصيرة · أدلة عددية · معالجة محلية'));
-  h+=panel(capT('Open capture','فتح ملف الالتقاط'),'<div class="field"><label for="forensicFile">PCAP / PCAPNG (≤ 32 MB)</label><input type="file" id="forensicFile" accept=".pcap,.pcapng,application/octet-stream"></div><button id="forensicOpen">'+capT('Analyze file','تحليل الملف')+'</button><p id="forensicError" class="alert" role="alert">'+esc(forensicError)+'</p><p class="sub">'+capT('Ethernet and raw IPv4; capture format is detected by header. No payload is read.','يدعم Ethernet وRaw IPv4، ويتعرف على الصيغة من الترويسة. لا يقرأ محتوى الحزم.')+'</p>');
+  h+=panel(capT('Open capture','فتح ملف الالتقاط'),'<div class="field"><label for="forensicFile">PCAP / PCAPNG (≤ 32 MB)</label><input type="file" id="forensicFile" accept=".pcap,.pcapng,application/octet-stream"></div><button id="forensicOpen">'+capT('Analyze file','تحليل الملف')+'</button><p id="forensicError" class="alert" role="alert">'+esc(forensicError)+'</p><p class="sub">'+capT('Capture format is detected by header. IPv4 metadata is analyzed; raw captured bytes can be inspected separately.','يتعرف على الصيغة من الترويسة، ويحلل بيانات IPv4. يمكن فحص البايتات الملتقطة بشكل منفصل.')+'</p>');
   if(!f)return h;
   h+='<p>'+esc(forensicFileName)+' · '+f.format+' · '+capT('Truncated frames: ','الإطارات المقتطعة: ')+fmt(f.truncated,0)+'</p><p class="sub" style="overflow-wrap:anywhere;direction:ltr">SHA-256: '+esc(f.sha256||'Unavailable in this context')+'</p><div class="kpis">'+kpi(capT('Frames','الإطارات'),fmt(f.frames,0),'frames')+kpi(capT('IPv4 analyzed','حزم IPv4 المحللة'),fmt(f.ipv4,0),'IPv4')+kpi(capT('Duration','مدة الالتقاط'),fmt(f.duration*1000,3),'ms')+kpi(capT('Skipped frames','الإطارات المستثناة'),fmt(f.skipped,0),'frames')+'</div>';
   h+=panel(capT('Protocol and TTL distributions','توزيع البروتوكولات وقيم TTL'),'<div class="two">'+table(['Protocol','Packets'],f.protocols.map(([p,n])=>[fp(p),n]))+'<div><label>TTL distribution</label><svg class="chart" viewBox="0 0 600 150" role="img" aria-label="TTL frequency histogram">'+f.ttlCounts.map(([x,n])=>'<rect x="'+(22+x*2.15)+'" y="'+(125-105*n/Math.max(...f.ttlCounts.map(a=>a[1])))+'" width="2" height="'+(105*n/Math.max(...f.ttlCounts.map(a=>a[1])))+'" fill="#148b88"><title>TTL '+x+': '+n+'</title></rect>').join('')+'<g fill="var(--muted)" font-size="10"><text x="22" y="140">0</text><text x="155" y="140">64</text><text x="292" y="140">128</text><text x="430" y="140">192</text><text x="560" y="140">255</text></g></svg></div></div>');
@@ -232,3 +237,68 @@ const forensicOldRender=render;render=function(){if(state.tab!=='forensics'){for
 const forensicOldLang=nnLangButton.onclick;nnLangButton.onclick=()=>{forensicOldLang();if(state.tab==='forensics')render()};
 if(new URLSearchParams(location.search).get('tab')==='forensics')state.tab='forensics';
 render();
+
+function exactFrameFilter(frames){
+  if(!frames.length)return '';
+  const a=[...new Set(frames)].sort((x,y)=>x-y),parts=[];
+  for(let i=0;i<a.length;){let j=i;while(j+1<a.length&&a[j+1]===a[j]+1)j++;parts.push(i===j?'frame.number == '+a[i]:'(frame.number >= '+a[i]+' && frame.number <= '+a[j]+')');i=j+1;if(parts.length>1000)return null;}
+  return parts.join(' || ');
+}
+function reconstructBits(items,bytes,o){
+  const {indexOffset,indexWidth,valueOffset,little,lsb,prefix}=o;
+  if(!Number.isInteger(indexOffset)||indexOffset<0||!Number.isInteger(indexWidth)||indexWidth<1||indexWidth>4||!Number.isInteger(valueOffset)||valueOffset<0||indexOffset+indexWidth>65536||valueOffset>=65536)throw Error('Invalid offsets or index width.');
+  if(!Array.isArray(prefix)||prefix.length>32||prefix.some(b=>!Number.isInteger(b)||b<0||b>255))throw Error('Invalid prefix.');
+  const seen=new Map();let skipped=0,duplicates=0;
+  for(const item of items){
+    if(item.payloadOffset===undefined||item.payloadLength<Math.max(indexOffset+indexWidth,valueOffset+1,prefix.length)){skipped++;continue}
+    const p=bytes.subarray(item.payloadOffset,item.payloadOffset+item.payloadLength);
+    if(prefix.some((b,i)=>p[i]!==b)){skipped++;continue}
+    const bit=p[valueOffset];if(bit!==0&&bit!==1)throw Error('Non-binary byte at frame '+item.frame+'. Refine the selection or offsets.');
+    let index=0;for(let j=0;j<indexWidth;j++)index=index*256+p[indexOffset+(little?indexWidth-1-j:j)];
+    if(seen.has(index)){if(seen.get(index).bit!==bit)throw Error('Conflicting values for index '+index+'.');duplicates++;continue}
+    if(seen.size>=65536)throw Error('Maximum 65,536 unique bits.');
+    seen.set(index,{bit,frame:item.frame});
+  }
+  const ordered=[...seen].sort((a,b)=>a[0]-b[0]);if(!ordered.length)throw Error('No matching payloads.');
+  const start=ordered[0][0];if(start!==0&&start!==1)throw Error('Index must start at 0 or 1; missing initial fragments.');
+  for(let i=0;i<ordered.length;i++)if(ordered[i][0]!==start+i)throw Error('Missing index '+(start+i)+'.');
+  if(ordered.length%8)throw Error('Incomplete byte: bit count must be divisible by 8.');
+  const out=new Uint8Array(ordered.length/8);for(let i=0;i<ordered.length;i++)out[i>>3]|=ordered[i][1].bit<<(lsb?i%8:7-i%8);
+  return {out,count:ordered.length,skipped,duplicates,frames:ordered.map(x=>x[1].frame)};
+}
+
+/* Explicit, local forensic inspection. Raw bytes are never included in automatic reports. */
+const hexBytes=b=>Array.from(b,x=>x.toString(16).padStart(2,'0')).join(' ').toUpperCase();
+const readable=b=>Array.from(b,x=>x>=32&&x<=126?String.fromCharCode(x):'.').join('');
+let inspectFrame=1,inspectSession=null,bitResult=null,bitError='',bitOptions={prefix:'',indexOffset:0,indexWidth:2,valueOffset:2,little:false,lsb:false};
+function evidenceItems(f){const g=f.groups[forensicSelected];return g?g.frames.map(n=>f.inventory[n-1]).filter(Boolean):[];}
+function forensicExtras(){
+ const f=forensicSession;if(!f)return '';
+ if(inspectSession!==f){inspectSession=f;inspectFrame=1;bitResult=null;bitError='';bitOptions={prefix:'',indexOffset:0,indexWidth:2,valueOffset:2,little:false,lsb:false};}
+ const g=f.groups[forensicSelected],items=evidenceItems(f),q=f.inventory[inspectFrame-1];
+ let h='';
+ if(g){const filter=exactFrameFilter(g.frames);h+=panel(capT('Exact Wireshark evidence','فلتر الأدلة الدقيق في Wireshark'),'<p class="sub">'+capT('This filter selects the recorded frame numbers, not every packet that happens to share the same addresses. Use the original capture.','يختار هذا الفلتر أرقام الإطارات التي حللتها الأداة، وليس كل الحزم المشتركة بالعناوين. استخدم ملف الالتقاط الأصلي.')+'</p>'+(filter?'<pre id="exactFilter" style="max-height:100px;overflow:auto">'+esc(filter)+'</pre><button id="copyExact">'+capT('Copy exact filter','نسخ الفلتر الدقيق')+'</button>':'<p>'+capT('Exact filter too long; use individual frame numbers or the group filter.','الفلتر الدقيق طويل جداً؛ استخدم أرقام الإطارات أو فلتر المجموعة.')+'</p>')+' <button id="inspectGroup">'+capT('Inspect first frame of group','فحص أول إطار بالمجموعة')+'</button><p id="exactStatus" role="status"></p>');}
+ h+=panel(capT('Packet inspector','فاحص الحزم'),'<div class="formgrid"><div class="field"><label for="inspectNumber">'+capT('Frame number','رقم الإطار')+'</label><input id="inspectNumber" type="number" min="1" max="'+f.frames+'" value="'+inspectFrame+'"></div><div class="field"><label>Wireshark</label><button id="copyFrame">'+capT('Copy frame filter','نسخ فلتر الإطار')+'</button></div></div><button id="inspectGo">'+capT('Inspect frame','فحص الإطار')+'</button> <button id="inspectPrev" '+(inspectFrame<=1?'disabled':'')+'>◀</button> <button id="inspectNext" '+(inspectFrame>=f.frames?'disabled':'')+'>▶</button><p id="inspectStatus" role="status"></p>'+(q?table(['Metric','Value'],[['Frame',q.frame],['Time (ms)',fmt((q.t-f.timeOrigin)*1000,6)],['Link type',q.link],['Captured / wire bytes',q.captured+' / '+q.wire],['Source',esc(q.src||'—')],['Destination',esc(q.dst||'—')],['Protocol',q.proto===undefined?'—':fp(q.proto)],['TTL',q.ttl??'—'],['Ports',q.sport===undefined?'—':q.sport+' → '+q.dport],['Transport payload bytes',q.payloadLength??'—']])+'<details><summary>'+capT('Captured frame bytes (first 256)','بايتات الإطار (أول 256)')+'</summary><pre>'+esc(hexBytes(f.bytes.subarray(q.offset,q.offset+Math.min(256,q.captured))))+'</pre></details>'+(q.payloadOffset===undefined?'<p class="sub">'+capT('No complete, unfragmented IPv4 TCP/UDP payload available.','لا تتوفر بيانات TCP/UDP كاملة وغير مجزأة ضمن IPv4.')+'</p>':'<label>'+capT('Transport payload · first 512 bytes','بيانات النقل · أول 512 بايت')+'</label><pre>'+esc(hexBytes(f.bytes.subarray(q.payloadOffset,q.payloadOffset+Math.min(512,q.payloadLength))))+'</pre><pre>'+esc(readable(f.bytes.subarray(q.payloadOffset,q.payloadOffset+Math.min(512,q.payloadLength))))+'</pre>'):''));
+ if(g){h+=panel(capT('Indexed binary evidence reconstruction','إعادة تجميع الدليل الثنائي المرتب'),'<p class="sub">'+capT('For a known indexed-bit format only. Inspect payloads first, then supply offsets relative to the transport payload (zero-based). No automatic flag guessing.','لصيغة أجزاء ثنائية مرتبة معروفة فقط. افحص البيانات أولاً ثم حدد الإزاحات من بداية بيانات النقل (تبدأ من الصفر). لا يخمّن الفلاك تلقائياً.')+'</p><div class="formgrid"><div class="field"><label for="bitPrefix">'+capT('Optional hex prefix','بادئة Hex اختيارية')+'</label><input id="bitPrefix" value="'+esc(bitOptions.prefix)+'" placeholder="AA BB" maxlength="96"></div><div class="field"><label for="bitIndex">'+capT('Index offset','إزاحة رقم الجزء')+'</label><input id="bitIndex" type="number" min="0" max="65535" value="'+bitOptions.indexOffset+'"></div><div class="field"><label for="bitWidth">'+capT('Index width (bytes)','عرض رقم الجزء (بايت)')+'</label><select id="bitWidth">'+[1,2,3,4].map(n=>'<option value="'+n+'" '+(n===bitOptions.indexWidth?'selected':'')+'>'+n+'</option>').join('')+'</select></div><div class="field"><label for="bitValue">'+capT('Bit value offset (00 or 01)','إزاحة قيمة البت (00 أو 01)')+'</label><input id="bitValue" type="number" min="0" max="65535" value="'+bitOptions.valueOffset+'"></div><div class="field"><label for="bitEndian">Index byte order</label><select id="bitEndian"><option value="be" '+(!bitOptions.little?'selected':'')+'>Big endian</option><option value="le" '+(bitOptions.little?'selected':'')+'>Little endian</option></select></div><div class="field"><label for="bitOrder">Bit order</label><select id="bitOrder"><option value="msb" '+(!bitOptions.lsb?'selected':'')+'>MSB first</option><option value="lsb" '+(bitOptions.lsb?'selected':'')+'>LSB first</option></select></div></div><button id="bitRun">'+capT('Reconstruct selected evidence','إعادة تجميع الأدلة المحددة')+'</button><p class="alert" role="alert">'+esc(bitError)+'</p>'+(bitResult?'<p>'+bitResult.count+' bits · '+bitResult.out.length+' bytes · duplicates: '+bitResult.duplicates+' · excluded: '+bitResult.skipped+'</p><pre>'+esc(readable(bitResult.out))+'</pre><details><summary>HEX</summary><pre>'+esc(hexBytes(bitResult.out))+'</pre></details><button id="bitSave">'+capT('Save reconstructed bytes','حفظ البايتات المسترجعة')+'</button> <button id="bitCopyFilter">'+capT('Copy evidence frame filter','نسخ فلتر إطارات الدليل')+'</button><p id="bitStatus" role="status"></p>':''));}
+ return h;
+}
+const forensicBasePage=forensicPage;forensicPage=function(){return forensicBasePage()+forensicExtras()};
+const forensicBaseBind=forensicBind;forensicBind=function(){
+ forensicBaseBind();const f=forensicSession;if(!f)return;
+ const say=(id,s)=>{if($(id))$(id).textContent=s;};
+ async function copyEvidence(s,id){if(!s){say(id,capT('Filter too long.','الفلتر طويل جداً.'));return}try{await navigator.clipboard.writeText(s);say(id,capT('Copied','تم النسخ'))}catch{say(id,capT('Clipboard unavailable; select the displayed filter.','الحافظة غير متاحة؛ حدد الفلتر المعروض وانسخه.'))}}
+ const go=n=>{if(!Number.isInteger(n)||n<1||n>f.frames){say('inspectStatus',capT('Invalid frame number','رقم إطار غير صالح'));return}inspectFrame=n;render();$('inspectNumber')?.scrollIntoView({block:'nearest'})};
+ if($('copyExact'))$('copyExact').onclick=()=>copyEvidence(exactFrameFilter(evidenceItems(f).map(q=>q.frame)),'exactStatus');
+ if($('inspectGroup'))$('inspectGroup').onclick=()=>go(evidenceItems(f)[0].frame);
+ $('copyFrame').onclick=()=>copyEvidence('frame.number == '+inspectFrame,'inspectStatus');
+ $('inspectGo').onclick=()=>go(Number($('inspectNumber').value));$('inspectPrev').onclick=()=>go(inspectFrame-1);$('inspectNext').onclick=()=>go(inspectFrame+1);
+ document.querySelectorAll('[data-forensic]').forEach(b=>{const prev=b.onclick;b.onclick=()=>{bitResult=null;bitError='';prev()}});
+ if($('bitRun'))$('bitRun').onclick=()=>{try{
+  bitOptions={prefix:$('bitPrefix').value,indexOffset:Number($('bitIndex').value),indexWidth:Number($('bitWidth').value),valueOffset:Number($('bitValue').value),little:$('bitEndian').value==='le',lsb:$('bitOrder').value==='lsb'};
+  const prefix=bitOptions.prefix.replace(/\s+/g,'');if(!/^(?:[0-9a-fA-F]{2})*$/.test(prefix)||prefix.length>64)throw Error('Invalid hexadecimal prefix.');
+  bitResult=reconstructBits(evidenceItems(f),f.bytes,{...bitOptions,prefix:prefix.match(/../g)?.map(x=>parseInt(x,16))||[]});bitError='';
+ }catch(e){bitResult=null;bitError=e.message}render();$('bitRun')?.scrollIntoView({block:'nearest'})};
+ if($('bitSave'))$('bitSave').onclick=()=>download('reconstructed-evidence.bin',bitResult.out,'application/octet-stream');
+ if($('bitCopyFilter'))$('bitCopyFilter').onclick=()=>copyEvidence(exactFrameFilter(bitResult.frames),'bitStatus');
+};
+if(state.tab==='forensics')render();
