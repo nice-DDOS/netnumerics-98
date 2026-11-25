@@ -142,3 +142,90 @@ render=function(){
 };
 const capOldToggle=nnLangButton.onclick;nnLangButton.onclick=()=>{capOldToggle();if(state.tab==='capture')render();};
 render();
+
+function forensicAnalyze(buffer){
+  const v=new DataView(buffer),N=v.byteLength;if(N<24||N>32*1024*1024)throw Error('Capture size must be 24 bytes–32 MB.');
+  const rows=[];let frames=0,skipped=0,format='',interfaces=[],first=null,last=null;
+  function record(p,n,link,t){
+    if(++frames>250000)throw Error('Maximum 250,000 frames.');
+    if(!Number.isFinite(t))throw Error('Invalid timestamp.');
+    first=first===null?t:Math.min(first,t);last=last===null?t:Math.max(last,t);
+    const end=p+n;let type=0x0800;
+    if(link===1){if(n<14){skipped++;return}type=v.getUint16(p+12,false);p+=14;for(let k=0;k<2&&(type===0x8100||type===0x88a8)&&p+4<=end;k++){type=v.getUint16(p+2,false);p+=4}}
+    else if(link!==101&&link!==228){skipped++;return}
+    if(type!==0x0800||p+20>end||v.getUint8(p)>>4!==4){skipped++;return}
+    const ihl=(v.getUint8(p)&15)*4,len=v.getUint16(p+2,false);
+    if(ihl<20||len<ihl||p+ihl>end){skipped++;return}
+    const ip=i=>[0,1,2,3].map(k=>v.getUint8(i+k)).join('.');
+    const proto=v.getUint8(p+9),ttl=v.getUint8(p+8),src=ip(p+12),dst=ip(p+16);
+    rows.push({frame:frames,t,src,dst,proto,ttl,len});
+  }
+  const magic=v.getUint32(0,false);
+  if([0xa1b2c3d4,0xd4c3b2a1,0xa1b23c4d,0x4d3cb2a1].includes(magic)){
+    format='PCAP';const le=magic===0xd4c3b2a1||magic===0x4d3cb2a1,scale=magic===0xa1b23c4d||magic===0x4d3cb2a1?1e9:1e6;
+    if(v.getUint16(4,le)!==2||v.getUint16(6,le)!==4)throw Error('Unsupported PCAP version.');
+    const link=v.getUint32(20,le)&65535;let p=24;
+    while(p<N){if(p+16>N)throw Error('Truncated PCAP record.');const sec=v.getUint32(p,le),frac=v.getUint32(p+4,le),n=v.getUint32(p+8,le),wire=v.getUint32(p+12,le);p+=16;if(frac>=scale||n>wire||p+n>N)throw Error('Invalid PCAP record.');record(p,n,link,sec+frac/scale);p+=n}
+  }else if(magic===0x0a0d0d0a){
+    format='PCAPNG';let p=0,le=true,section=false;
+    while(p<N){
+      if(p+12>N)throw Error('Truncated PCAPNG block.');
+      if(v.getUint32(p,false)===0x0a0d0d0a){if(p+28>N)throw Error('Truncated section header.');const bom=v.getUint32(p+8,false);if(bom!==0x1a2b3c4d&&bom!==0x4d3c2b1a)throw Error('Invalid PCAPNG byte order.');le=bom===0x4d3c2b1a;section=true;interfaces=[]}
+      if(!section)throw Error('Missing PCAPNG section.');
+      const type=v.getUint32(p,le),size=v.getUint32(p+4,le),end=p+size;
+      if(size<12||size%4||end>N||v.getUint32(end-4,le)!==size)throw Error('Invalid PCAPNG block length.');
+      if(type===0x0a0d0d0a){if(size<28||v.getUint16(p+12,le)!==1)throw Error('Unsupported PCAPNG section.')}
+      else if(type===1){if(size<20)throw Error('Truncated interface block.');let res=1e-6,offset=0;for(let q=p+16;q+4<=end-4;){const code=v.getUint16(q,le),len=v.getUint16(q+2,le);q+=4;if(code===0)break;if(q+Math.ceil(len/4)*4>end-4)throw Error('Invalid interface option.');if(code===9&&len===1){const x=v.getUint8(q);res=x&128?2**-(x&127):10**-x}if(code===14&&len===8)offset=Number(v.getBigInt64(q,le));q+=Math.ceil(len/4)*4}interfaces.push({link:v.getUint16(p+8,le),res,offset});}
+      else if(type===6){if(size<32)throw Error('Truncated enhanced packet block.');const it=interfaces[v.getUint32(p+8,le)],n=v.getUint32(p+20,le),wire=v.getUint32(p+24,le);if(!it||n>wire||p+28+Math.ceil(n/4)*4>end-4)throw Error('Invalid enhanced packet block.');const t=(v.getUint32(p+12,le)*4294967296+v.getUint32(p+16,le))*it.res+it.offset;record(p+28,n,it.link,t);}
+      else if(type===2||type===3){throw Error('Legacy or untimestamped PCAPNG packet blocks are not supported. Export as classic PCAP.');}
+      p=end;
+    }
+  }else throw Error('Unknown capture signature. File extension is not used to determine format.');
+  if(!rows.length)throw Error('No supported IPv4 packets (Ethernet or raw IPv4).');
+  const groups=new Map(),protoStats=new Map(),ttlCounts=new Map();
+  for(const x of rows){const key=x.src+' → '+x.dst+' / '+x.proto;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(x);if(!protoStats.has(x.proto))protoStats.set(x.proto,{n:0,sum:0,sq:0});const s=protoStats.get(x.proto);s.n++;s.sum+=x.ttl;s.sq+=x.ttl*x.ttl;ttlCounts.set(x.ttl,(ttlCounts.get(x.ttl)||0)+1)}
+  const mean=a=>a.reduce((s,x)=>s+x,0)/a.length;
+  const result=[];
+  for(const a of groups.values()){
+    if(a.length<5)continue;
+    const x=a[0],n=a.length,ttl=mean(a.map(q=>q.ttl)),sd=Math.sqrt(mean(a.map(q=>(q.ttl-ttl)**2))),len=mean(a.map(q=>q.len)),lsd=Math.sqrt(mean(a.map(q=>(q.len-len)**2)));
+    const s=protoStats.get(x.proto),rn=s.n-n,rs=s.sum-ttl*n,rq=s.sq-a.reduce((t,q)=>t+q.ttl*q.ttl,0),ref=rn>=10?rs/rn:null,refSD=ref===null?null:Math.sqrt(Math.max(0,rq/rn-ref*ref)),abs=ref===null?null:Math.abs(ttl-ref),relative=ref===null||ref===0?null:100*abs/Math.abs(ref),z=refSD===null||refSD===0?null:abs/refSD;
+    const sorted=a.slice().sort((a,b)=>a.t-b.t||a.frame-b.frame),start=sorted[0].t,end=sorted.at(-1).t,d=end-start;
+    let slope=null,rmse=null;
+    if(d>0){const u=sorted.map(q=>(q.t-start)/d),ux=mean(u),uy=(n+1)/2;let xx=0,xy=0;for(let i=0;i<n;i++){xx+=(u[i]-ux)**2;xy+=(u[i]-ux)*(i+1-uy)}if(xx>0){const b=xy/xx,c=uy-b*ux;slope=b/d;rmse=Math.sqrt(mean(u.map((t,i)=>(i+1-c-b*t)**2)));}}
+    result.push({src:x.src,dst:x.dst,proto:x.proto,n,ttl,sd,len,lsd,ref,refSD,referenceCount:rn,abs,relative,z,slope,rmse,start:start-first,end:end-first,frames:a.map(q=>q.frame),filter:'ip.src == '+x.src+' && ip.dst == '+x.dst+' && ip.proto == '+x.proto});
+  }
+  result.sort((a,b)=>(b.z??-1)-(a.z??-1)||b.n-a.n);
+  return {format,frames,ipv4:rows.length,skipped,duration:last-first,protocols:[...protoStats].map(([p,s])=>[p,s.n]),ttlCounts:[...ttlCounts].sort((a,b)=>a[0]-b[0]),groups:result};
+}
+
+/* Offline forensic review of packet metadata; no payload extraction or network activity. */
+let forensicSession=null,forensicFileName='',forensicError='';
+const fp=p=>({6:'TCP',17:'UDP',1:'ICMP'})[p]||'IP-'+p;
+function forensicPage(){
+  const f=forensicSession;
+  let h=head(capT('Packet forensic analysis','التحليل الجنائي للحزم'),capT('PCAP / PCAPNG · short captures · numerical evidence · local processing','PCAP / PCAPNG · الالتقاطات القصيرة · أدلة عددية · معالجة محلية'));
+  h+=panel(capT('Open capture','فتح ملف الالتقاط'),'<div class="field"><label for="forensicFile">PCAP / PCAPNG (≤ 32 MB)</label><input type="file" id="forensicFile" accept=".pcap,.pcapng,application/octet-stream"></div><button id="forensicOpen">'+capT('Analyze file','تحليل الملف')+'</button><p id="forensicError" class="alert" role="alert">'+esc(forensicError)+'</p><p class="sub">'+capT('Ethernet and raw IPv4; capture format is detected by header. No payload is read.','يدعم Ethernet وRaw IPv4، ويتعرف على الصيغة من الترويسة. لا يقرأ محتوى الحزم.')+'</p>');
+  if(!f)return h;
+  h+='<p>'+esc(forensicFileName)+' · '+f.format+'</p><div class="kpis">'+kpi(capT('Frames','الإطارات'),fmt(f.frames,0),'frames')+kpi(capT('IPv4 analyzed','حزم IPv4 المحللة'),fmt(f.ipv4,0),'IPv4')+kpi(capT('Duration','مدة الالتقاط'),fmt(f.duration*1000,3),'ms')+kpi(capT('Skipped frames','الإطارات المستثناة'),fmt(f.skipped,0),'frames')+'</div>';
+  h+=panel(capT('Protocol and TTL distributions','توزيع البروتوكولات وقيم TTL'),'<div class="two">'+table(['Protocol','Packets'],f.protocols.map(([p,n])=>[fp(p),n]))+'<div><label>TTL distribution</label><svg class="chart" viewBox="0 0 600 150" role="img" aria-label="TTL frequency histogram">'+f.ttlCounts.map(([x,n])=>'<rect x="'+(22+x*2.15)+'" y="'+(125-105*n/Math.max(...f.ttlCounts.map(a=>a[1])))+'" width="2" height="'+(105*n/Math.max(...f.ttlCounts.map(a=>a[1])))+'" fill="#148b88"><title>TTL '+x+': '+n+'</title></rect>').join('')+'<g fill="var(--muted)" font-size="10"><text x="22" y="140">0</text><text x="155" y="140">64</text><text x="292" y="140">128</text><text x="430" y="140">192</text><text x="560" y="140">255</text></g></svg></div></div>');
+  h+=panel(capT('Flow evidence — ranked by TTL deviation','أدلة التدفقات — مرتبة حسب انحراف TTL'),'<p class="sub">'+capT('Groups are source/destination/protocol, with at least 5 packets. Reference = other packets of the same protocol, at least 10. Z is descriptive, not an attack probability; differing routes and OS settings can cause TTL differences.','التجميع حسب المصدر والوجهة والبروتوكول، بخمس حزم على الأقل. المرجع هو بقية حزم البروتوكول نفسه (10 على الأقل). قيمة Z وصفية وليست احتمال هجوم؛ المسارات وأنظمة التشغيل المختلفة قد تغير TTL.')+'</p>'+table([capT('Flow','التدفق'),'Protocol',capT('Packets','الحزم'),capT('Mean TTL','متوسط TTL'),'SD TTL','|Δ TTL|','Z',capT('Evidence','الدليل')],f.groups.slice(0,100).map((g,i)=>[esc(g.src+' → '+g.dst),fp(g.proto),g.n,fmt(g.ttl),fmt(g.sd),fmt(g.abs),fmt(g.z),'<button data-forensic="'+i+'">'+capT('Inspect','فحص')+'</button>']))+'<p class="sub">'+capT('Up to 100 groups shown; export contains all qualifying groups. Small flows are omitted from ranking, not from reference counts.','يعرض أول 100 تدفق؛ التقرير يحتوي كل المجموعات المؤهلة. التدفقات الصغيرة مستثناة من الترتيب لا من المرجع.')+'</p><button id="forensicExport">'+capT('Export forensic JSON','تصدير تقرير التحقيق JSON')+'</button>');
+  if(forensicSelected>=0&&f.groups[forensicSelected]){
+    const g=f.groups[forensicSelected];
+    h+=panel(capT('Numerical evidence and Wireshark filter','الدليل العددي وفلتر Wireshark'),'<div class="two"><div>'+table(['Metric','Value'],[['Group packets',g.n],['Reference packets',g.referenceCount],['Mean TTL',fmt(g.ttl)],['Reference TTL',fmt(g.ref)],['Reference SD',fmt(g.refSD)],['Absolute deviation',fmt(g.abs)],['Relative deviation (%)',fmt(g.relative)],['Mean IP length (B)',fmt(g.len)],['IP length SD (B)',fmt(g.lsd)],['Least squares slope (packets/s)',fmt(g.slope)],['Fit RMSE (packets)',fmt(g.rmse)],['First / last (ms)',fmt(g.start*1000)+' / '+fmt(g.end*1000)]])+'</div><div><pre>μ = Σ TTL / n\nΔ = |μ − μ_ref|\nRelative deviation = 100 Δ / |μ_ref|\nZ = Δ / σ_ref\nC(t) ≈ a + b t\nRMSE = √(Σ(Cᵢ − Ĉᵢ)² / n)</pre><p class="sub">'+capT('Least squares fits cumulative packet count versus time. Its slope describes observed rate; RMSE measures fit error. Constant TTL or packet length alone does not establish a hidden channel.','المربعات الصغرى تلائم عدد الحزم التراكمي مع الزمن. الميل يصف المعدل المرصود وRMSE خطأ الملاءمة. ثبات TTL أو طول الحزمة وحده لا يثبت وجود قناة خفية.')+'</p><label>Wireshark display filter</label><pre>'+esc(g.filter)+'</pre><button id="forensicCopy">'+capT('Copy filter','نسخ الفلتر')+'</button><p id="forensicCopyStatus" role="status"></p><label>'+capT('Frame numbers (first 100)','أرقام الإطارات (أول 100)')+'</label><pre>'+g.frames.slice(0,100).join(', ')+'</pre></div></div>');
+  }
+  return h+'<div class="notice">'+capT('Investigative leads only. Confirm with protocol context, capture point, and authorized logs. Metadata anomalies do not prove covert channels or attacks.','مؤشرات للتحقيق فقط. تحقق منها بسياق البروتوكول وموقع الالتقاط والسجلات المصرح بها. الشذوذ لا يثبت قناة خفية أو هجوماً.')+'</div>';
+}
+let forensicSelected=-1;
+function forensicBind(){
+  $('forensicOpen').onclick=async()=>{try{const file=$('forensicFile').files[0];if(!file)throw Error(capT('Select a file.','اختر ملفاً.'));if(file.size>32*1024*1024)throw Error('Maximum 32 MB.');const result=forensicAnalyze(await file.arrayBuffer());forensicSession=result;forensicFileName=file.name;forensicError='';forensicSelected=result.groups.length?0:-1;render()}catch(e){forensicError=e.message;$('forensicError').textContent=forensicError;}};
+  document.querySelectorAll('[data-forensic]').forEach(b=>b.onclick=()=>{forensicSelected=Number(b.dataset.forensic);render();$('forensicCopy')?.scrollIntoView({block:'nearest'})});
+  if($('forensicExport'))$('forensicExport').onclick=()=>download('netnumerics-forensics.json',JSON.stringify({file:forensicFileName,...forensicSession,disclaimer:'Descriptive metadata evidence, not proof of attack. Contains IP addresses.'},null,2),'application/json');
+  if($('forensicCopy'))$('forensicCopy').onclick=async()=>{try{await navigator.clipboard.writeText(forensicSession.groups[forensicSelected].filter);$('forensicCopyStatus').textContent=capT('Copied','تم النسخ')}catch{$('forensicCopyStatus').textContent=capT('Select and copy the filter text above.','حدد نص الفلتر أعلاه وانسخه.')}};
+}
+names.forensics='Packet forensics';nnArabic.set('Packet forensics','التحليل الجنائي للحزم');nnArabic.set('▤ Packet forensics','▤ التحليل الجنائي للحزم');nnArabic.set('Protocol','البروتوكول');nnArabic.set('Packets','الحزم');nnArabic.set('Metric','المقياس');nnArabic.set('Value','القيمة');nnArabic.set('Group packets','حزم المجموعة');nnArabic.set('Reference packets','حزم المرجع');nnArabic.set('Mean TTL','متوسط TTL');nnArabic.set('Reference TTL','متوسط TTL المرجعي');nnArabic.set('Reference SD','الانحراف المعياري للمرجع');nnArabic.set('Absolute deviation','الانحراف المطلق');nnArabic.set('Relative deviation (%)','الانحراف النسبي (%)');nnArabic.set('Mean IP length (B)','متوسط طول IP (بايت)');nnArabic.set('IP length SD (B)','الانحراف المعياري للطول (بايت)');nnArabic.set('Least squares slope (packets/s)','ميل المربعات الصغرى (حزمة/ث)');nnArabic.set('Fit RMSE (packets)','خطأ الملاءمة RMSE (حزمة)');nnArabic.set('First / last (ms)','الأول / الأخير (ms)');nnArabic.set('Wireshark display filter','فلتر عرض Wireshark');nnArabic.set('TTL distribution','توزيع TTL');
+const forensicNav=document.createElement('button');forensicNav.dataset.tab='forensics';forensicNav.textContent='▤ Packet forensics';document.querySelector('.sidebar .sidehead').after(forensicNav);
+const forensicOldRender=render;render=function(){if(state.tab!=='forensics'){forensicOldRender();return}$('address').textContent=names.forensics;document.querySelectorAll('.sidebar [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab==='forensics'));$('content').innerHTML=forensicPage();forensicBind();nnLocalize()};
+const forensicOldLang=nnLangButton.onclick;nnLangButton.onclick=()=>{forensicOldLang();if(state.tab==='forensics')render()};
+if(new URLSearchParams(location.search).get('tab')==='forensics')state.tab='forensics';
+render();
