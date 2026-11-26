@@ -42,7 +42,7 @@ jobs:
           for name in ('engine.js', 'app.js'):
               html = html.replace('<script src="' + name + '"></script>', '<script>' + (p / name).read_text(encoding='utf-8') + '</script>')
           assert "let nnLang='ar'" in html and 'nnLangButton' in html and '100dvh' in html
-          html = html.replace('<span class="task">▣ NetNumerics 98</span>', '<span class="task">▣ NetNumerics 98 · v1.1 AR</span>')
+          html = html.replace('<span class="task">▣ NetNumerics 98</span>', '<span class="task">▣ NetNumerics 98 · v1.2 DFIR</span>')
           (p / 'index.html').write_text(html, encoding='utf-8')
           (p / 'ar.html').write_text(html, encoding='utf-8')
           PY
@@ -86,7 +86,7 @@ jobs:
             try {
               const page=await browser.newPage({viewport:{width:1440,height:900}});
               const errors=[];page.on('pageerror',e=>errors.push(e.message));
-              await page.goto('http://127.0.0.1:8765/ar.html?lang=ar');
+              await page.goto('http://127.0.0.1:8765/ar.html?lang=ar&tab=dashboard');
               await page.waitForFunction(()=>document.documentElement.lang==='ar' && document.querySelector('#content h1')?.textContent.includes('نشاط الشبكة'));
               await page.waitForFunction(()=>document.querySelector('#runtime')?.textContent.includes('RUST / WASM'));
               const before=await page.locator('.kpi strong').allTextContents();
@@ -132,6 +132,23 @@ jobs:
               await page.locator('#capAnalyze').click();
               assert.equal(await page.locator('.kpi strong').first().innerText(),'0');
               console.log('PASS: PCAP import, numerical results, JSON evidence, bilingual UI and destination filter');
+              await page.goto('http://127.0.0.1:8765/ar.html?lang=ar&mode=beginner');
+              await page.locator('#nnCapture').waitFor();
+              assert.match(await page.locator('#content h1').innerText(),/حلّل ملف الشبكة/);
+              await page.locator('#nnTryDemo').click();
+              await page.locator('.nn-case').waitFor();
+              assert.equal(await page.locator('.nn-case .kpi strong').first().innerText(),'1,011');
+              const beginnerKPIs=await page.locator('.nn-case .kpi strong').allTextContents();
+              await page.locator('#language').click();
+              assert.equal(await page.locator('#content h1').innerText(),'Investigate a network capture');
+              assert.deepEqual(await page.locator('.nn-case .kpi strong').allTextContents(),beginnerKPIs);
+              await page.locator('#nnMode').click();
+              await page.locator('#forensicFile').waitFor();
+              assert.equal(await page.locator('.kpi strong').first().innerText(),'1,011');
+              await page.locator('#nnMode').click();
+              await page.locator('.nn-case').waitFor();
+              assert.deepEqual(await page.locator('.nn-case .kpi strong').allTextContents(),beginnerKPIs);
+              console.log('PASS: beginner landing, sample capture, language switch and analyst mode');
               assert.deepEqual(errors,[]);
               console.log('PASS: Arabic/English toggle, unchanged KPIs, WASM, compact desktop and navigation');
             } finally {await browser.close()}
