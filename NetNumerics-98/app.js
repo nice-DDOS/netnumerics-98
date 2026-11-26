@@ -302,3 +302,68 @@ const forensicBaseBind=forensicBind;forensicBind=function(){
  if($('bitCopyFilter'))$('bitCopyFilter').onclick=()=>copyEvidence(exactFrameFilter(bitResult.frames),'bitStatus');
 };
 if(state.tab==='forensics')render();
+
+
+/* Guided investigation workspace. Presentation layer only; uses the existing parser and numerical engine. */
+let nnMode='beginner',nnBusy=false,nnLoadMessage='',nnDemo=false;
+try{const p=new URLSearchParams(location.search),m=p.get('mode')||localStorage.getItem('nn-mode');if(m==='analyst')nnMode='analyst';}catch{}
+const nnModeButton=document.createElement('button');nnModeButton.id='nnMode';nnModeButton.type='button';nnLangButton.before(nnModeButton);
+const uxT=(en,ar)=>capT(en,ar);
+const uxText=(en,ar)=>esc(uxT(en,ar));
+const uxPrimary=(id,label,disabled=false)=>'<button class="nn-primary" id="'+id+'" '+(disabled?'disabled':'')+'>'+label+'</button>';
+function uxGuide(){
+ const f=forensicSession, selected=f?.groups[forensicSelected], candidates=f?.groups.filter(g=>g.abs!==null&&g.abs>0)||[];
+ const dir=nnLang==='ar'?'rtl':'ltr';
+ let h='<div class="nn-guide" dir="'+dir+'"><div class="nn-hero"><div class="nn-eyebrow">NETNUMERICS 98 / DFIR</div><h1>'+uxText('Investigate a network capture','حلّل ملف الشبكة')+'</h1><p>'+uxText('Find the evidence worth reviewing, understand why, and verify it in Wireshark.','اعثر على الأدلة التي تستحق المراجعة، افهم سبب اختيارها، وتحقق منها داخل Wireshark.')+'</p><div class="nn-steps"><span class="'+(!f?'current':'')+'">01 '+uxText('Open file','فتح الملف')+'</span><span class="'+(f?'current':'')+'">02 '+uxText('Review evidence','مراجعة الأدلة')+'</span><span>03 '+uxText('Verify in Wireshark','التحقق في Wireshark')+'</span></div></div>';
+ h+='<section class="nn-drop" id="nnDrop"><div class="nn-drop-icon" aria-hidden="true">▤</div><div class="nn-drop-body"><label for="nnCapture">'+uxText('Choose a PCAP / PCAPNG file','اختر ملف PCAP / PCAPNG')+'</label><p class="sub">'+uxText('Drag and drop, or choose a file. Processing stays in this browser. Maximum 32 MB.','اسحب الملف هنا أو اختره. المعالجة داخل المتصفح. الحد الأقصى 32 ميغابايت.')+'</p><input id="nnCapture" type="file" accept=".pcap,.pcapng,application/octet-stream" '+(nnBusy?'disabled':'')+'><div class="nn-actions">'+uxPrimary('nnAnalyze',uxText('Analyze capture','تحليل الملف'),nnBusy)+'<button id="nnTryDemo" '+(nnBusy?'disabled':'')+'>'+uxText('Try lab example','جرّب مثال المختبر')+'</button></div><p class="sub">'+uxText('Lab example is synthetic, not a recorded attack.','مثال المختبر اصطناعي وليس تسجيل هجوم.')+'</p><p id="nnProgress" role="status">'+esc(nnBusy?uxT('Reading capture…','جارٍ قراءة الملف…'):nnLoadMessage||forensicError)+'</p></div></section>';
+ if(!f){h+='<div class="nn-intro"><article><b>01 / '+uxText('Find patterns','اكتشف الأنماط')+'</b><p>'+uxText('Compare packet groups and their TTL values.','قارن مجموعات الحزم وقيم TTL.')+'</p></article><article><b>02 / '+uxText('Understand the math','افهم الحسابات')+'</b><p>'+uxText('See measured differences and numerical fit.','شاهد الانحرافات والملاءمة العددية.')+'</p></article><article><b>03 / '+uxText('Verify the evidence','تحقق من الدليل')+'</b><p>'+uxText('Copy a display filter into Wireshark.','انسخ فلتر العرض إلى Wireshark.')+'</p></article></div>';return h+'</div>';}
+ h+='<section class="nn-case"><div class="nn-eyebrow">'+uxText('CAPTURE SUMMARY','ملخص الملف')+'</div><h2>'+esc(forensicFileName)+'</h2><p class="sub">'+esc(f.format)+' · '+(nnDemo?uxText('Synthetic lab example','مثال مختبري اصطناعي'):uxText('Imported capture','ملف مستورد'))+' · '+uxText('Skipped','مستثناة')+': '+fmt(f.skipped,0)+' · '+uxText('Truncated','مقتطعة')+': '+fmt(f.truncated,0)+'</p><div class="kpis">'+kpi(uxT('Frames','الإطارات'),fmt(f.frames,0),uxT('total','إجمالي'))+kpi(uxT('IPv4 analyzed','IPv4 محللة'),fmt(f.ipv4,0),uxT('frames','إطار'))+kpi(uxT('Duration','المدة'),fmt(f.duration*1000,3),'ms')+kpi(uxT('Comparable groups','مجموعات قابلة للمقارنة'),fmt(f.groups.filter(g=>g.ref!==null).length,0),uxT('groups','مجموعة'))+'</div><details><summary>'+uxText('File integrity SHA-256','بصمة سلامة الملف SHA-256')+'</summary><pre>'+esc(f.sha256||'Unavailable')+'</pre><p class="sub">'+uxText('A hash identifies these bytes; it does not establish authenticity by itself.','البصمة تعرّف بايتات الملف، ولا تثبت أصالته وحدها.')+'</p></details><button id="nnReport">'+uxText('Export investigation report','تصدير تقرير التحقيق')+'</button></section>';
+ h+='<section class="nn-findings"><h2>'+uxText('Start your investigation here','ابدأ التحقيق من هنا')+'</h2><p class="sub">'+uxText('Ranked TTL differences among comparable groups, not confirmed threats.','فروق TTL مرتبة بين المجموعات القابلة للمقارنة، وليست تهديدات مؤكدة.')+'</p>';
+ if(!candidates.length)h+='<div class="notice">'+uxText('No comparable nonzero TTL difference found. This does not establish that the capture is safe. Open analyst mode to inspect all supported evidence.','لم نجد فرق TTL غير صفري ضمن المجموعات القابلة للمقارنة. هذا لا يعني أن الملف آمن. افتح وضع المحلل لفحص بقية الأدلة المدعومة.')+'</div>';
+ for(const g of candidates.slice(0,5)){
+  const idx=f.groups.indexOf(g),exact=exactFrameFilter(g.frames),filter=exact||g.filter;
+  h+='<article class="nn-finding"><div class="nn-finding-head"><span class="nn-eyebrow">'+uxText('REVIEW / TTL','مراجعة / TTL')+'</span><b>'+fmt(g.n,0)+' '+uxText('frames','إطار')+'</b></div><h3 dir="ltr">'+esc(g.src+' → '+g.dst)+' / '+fp(g.proto)+'</h3><div class="nn-evidence"><div><small>'+uxText('Observed mean TTL','متوسط TTL المرصود')+'</small><strong>'+fmt(g.ttl)+'</strong></div><div><small>'+uxText('Reference TTL','متوسط TTL المرجعي')+'</small><strong>'+fmt(g.ref)+'</strong></div><div><small>'+uxText('Absolute difference','الفرق المطلق')+'</small><strong>'+fmt(g.abs)+'</strong></div></div><p>'+uxText('Why review? This group differs from other packets of the same protocol. Routing and device settings may explain the difference.','ليش نراجعها؟ تختلف هذه المجموعة عن بقية حزم البروتوكول نفسه؛ قد يكون السبب مسار الشبكة أو إعدادات الأجهزة.')+'</p><label>'+uxText('Wireshark display filter','فلتر عرض Wireshark')+' · '+(exact?uxText('exact frames','إطارات دقيقة'):uxText('broader group filter','فلتر مجموعة أوسع'))+'</label><pre class="nn-filter" tabindex="0">'+esc(filter)+'</pre><div class="nn-actions"><button class="nn-primary" data-ux-copy="'+idx+'">'+uxText('Copy filter','نسخ الفلتر')+'</button><button data-ux-detail="'+idx+'">'+uxText('Numerical evidence & packet inspector','الدليل العددي وفحص الحزم')+'</button></div><p id="nnCopy'+idx+'" role="status" class="sub"></p></article>';
+ }
+ h+='</section><div class="notice">'+uxText('Verification: open the original file in Wireshark, paste the filter into the display filter bar and apply. Frame filters require the original frame order.','للتحقق: افتح الملف الأصلي داخل Wireshark، الصق الفلتر في شريط Display Filter ثم طبقه. فلاتر الإطارات تتطلب ترتيب الملف الأصلي.')+'</div><div class="nn-actions"><button id="nnDeep">'+uxText('Open full analyst workspace','فتح مساحة المحلل الكاملة')+'</button></div>';
+ return h+'</div>';
+}
+async function uxLoad(file,isDemo=false){
+ if(nnBusy)return;
+ const request=++forensicRequest;nnBusy=true;nnLoadMessage='';forensicSession=null;forensicSelected=-1;forensicError='';render();
+ try{
+  if(!file)throw Error(uxT('Choose a capture first.','اختر ملف الالتقاط أولاً.'));
+  if(file.size>32*1024*1024)throw Error(uxT('Maximum file size is 32 MB.','الحد الأقصى 32 ميغابايت.'));
+  const buffer=await file.arrayBuffer(),result=forensicAnalyze(buffer);
+  result.sha256=await captureDigest(buffer);
+  if(request!==forensicRequest)return;
+  forensicSession=result;forensicFileName=file.name;forensicSelected=result.groups.length?0:-1;nnDemo=isDemo;
+ }catch(e){if(request===forensicRequest){forensicError=e.message;forensicFileName='';}}
+ finally{nnBusy=false;if(state.tab==='forensics')render();}
+}
+function uxBind(){
+ $('nnAnalyze').onclick=()=>uxLoad($('nnCapture').files[0]);
+ const drop=$('nnDrop');drop.ondragover=e=>{e.preventDefault();drop.classList.add('dragging')};drop.ondragleave=()=>drop.classList.remove('dragging');drop.ondrop=e=>{e.preventDefault();drop.classList.remove('dragging');if(!nnBusy)uxLoad(e.dataTransfer.files[0])};
+ $('nnTryDemo').onclick=async()=>{if(nnBusy)return;nnBusy=true;render();try{const res=await fetch('NetNumerics-Lab-Sample.pcap');if(!res.ok)throw Error('Lab example is unavailable.');const blob=await res.blob();nnBusy=false;await uxLoad(new File([blob],'NetNumerics-Lab-Sample.pcap'),true)}catch(e){nnBusy=false;nnLoadMessage=e.message;render();}};
+ if($('nnReport'))$('nnReport').onclick=()=>download('netnumerics-forensics.json',JSON.stringify({file:forensicFileName,syntheticLabExample:nnDemo,...forensicSession,disclaimer:'Descriptive evidence, not proof of attack. Contains IP addresses.'},null,2),'application/json');
+ if($('nnDeep'))$('nnDeep').onclick=()=>uxSetMode('analyst');
+ document.querySelectorAll('[data-ux-detail]').forEach(b=>b.onclick=()=>{forensicSelected=Number(b.dataset.uxDetail);bitResult=null;bitError='';uxSetMode('analyst');$('forensicCopy')?.scrollIntoView({block:'nearest'});});
+ document.querySelectorAll('[data-ux-copy]').forEach(b=>b.onclick=async()=>{const i=Number(b.dataset.uxCopy),g=forensicSession.groups[i],filter=exactFrameFilter(g.frames)||g.filter;const say=s=>{if($('nnCopy'+i))$('nnCopy'+i).textContent=s};try{await navigator.clipboard.writeText(filter);say(uxT('Copied. Paste into Wireshark.','تم النسخ. الصقه داخل Wireshark.'));}catch{say(uxT('Select the displayed filter and copy it manually.','حدد الفلتر المعروض وانسخه يدوياً.'));}});
+}
+function uxSetMode(m){nnMode=m;try{localStorage.setItem('nn-mode',m)}catch{}render();}
+const nnLegacyRender=render;
+render=function(){
+ document.body.classList.toggle('nn-beginner',nnMode==='beginner'&&state.tab==='forensics');
+ nnModeButton.textContent=nnMode==='beginner'?uxT('Analyst mode','وضع المحلل'):uxT('Beginner mode','وضع المبتدئ');
+ if(state.tab==='forensics'&&nnMode==='beginner'){
+  $('address').textContent=uxT('Guided investigation','التحقيق الموجّه');document.querySelectorAll('.sidebar [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab==='forensics'));
+  $('content').innerHTML=uxGuide();uxBind();nnLocalize();
+ }else nnLegacyRender();
+};
+nnModeButton.onclick=()=>{if(state.tab!=='forensics')state.tab='forensics';uxSetMode(nnMode==='beginner'?'analyst':'beginner');$('content').scrollTop=0;};
+const uxLang=nnLangButton.onclick;nnLangButton.onclick=()=>{uxLang();render();};
+const uxOpen=document.createElement('button');uxOpen.type='button';uxOpen.id='uxOpen';uxOpen.dataset.tab='forensics';uxOpen.textContent='▤ Open capture';$('run').before(uxOpen);
+nnArabic.set('▤ Open capture','▤ فتح ملف الالتقاط');
+nnArabic.set('Guided investigation','التحقيق الموجّه');
+$('start').onclick=()=>{state.tab='forensics';render();$('content').scrollTop=0};
+const uxTab=new URLSearchParams(location.search).get('tab');state.tab=uxTab&&Object.prototype.hasOwnProperty.call(names,uxTab)?uxTab:'forensics';
+render();
